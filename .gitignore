@@ -1,0 +1,14 @@
+# Model weights
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Cache
+__pycache__/
+*.pyc
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

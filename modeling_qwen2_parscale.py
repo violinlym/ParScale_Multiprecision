@@ -100,7 +100,9 @@ class MultiPrecisionLinear(nn.Module): # 实现 “混合精度并行推理”
             # Standard FP forward
             return nn.functional.linear(x, self.weight, self.bias)
 
-        # Multi-precision forward: split by path and use different precisions
+        # Multi-precision forward:
+        # x keeps ParScale layout [(n_parscale * batch), seq, in], while assigned_bits
+        # is token-level [batch, seq, n_parscale]. We execute one path at a time.
         parscale_n = assigned_bits.shape[-1]
 
         # Check if input has been repeated
@@ -112,7 +114,9 @@ class MultiPrecisionLinear(nn.Module): # 实现 “混合精度并行推理”
         # Reshape to separate paths: [(parscale_n * batch), seq, in] -> [parscale_n, batch, seq, in]
         x_split = x.view(parscale_n, batch_per_path, x.shape[1], x.shape[2])
 
-        # assigned_bits must be token-level [batch, seq_len, parscale_n]
+        # Contract for token-level mixed precision:
+        # each token on each path can select its own bit width.
+        # shape = [batch, seq_len, n_parscale]
         if assigned_bits.dim() != 3:
             raise ValueError(
                 f"assigned_bits must be 3D [batch, seq, parscale_n], got shape {tuple(assigned_bits.shape)}"
@@ -136,7 +140,8 @@ class MultiPrecisionLinear(nn.Module): # 实现 “混合精度并行推理”
             path_bits = bits_view[:, :, i]  # [batch, seq]
             unique_bits = torch.unique(path_bits)
 
-            # Fast path: one precision for the entire path
+            # Fast path: this path uses one bit width for all tokens.
+            # A single linear is enough.
             if unique_bits.numel() == 1:
                 bit_val = int(unique_bits.item())
                 weight_i = self.mp_weight.get_weight(bit_val)
@@ -144,7 +149,9 @@ class MultiPrecisionLinear(nn.Module): # 实现 “混合精度并行推理”
                 outputs.append(output_i)
                 continue
 
-            # Token-level mixed precision: group tokens by bit-width
+            # Token-level mixed precision:
+            # group tokens with the same bit and run one linear per bit group.
+            # This is equivalent to per-token execution but avoids a Python loop per token.
             x_flat = x_i.reshape(-1, x_i.shape[-1])  # [batch * seq, in_features]
             bits_flat = path_bits.reshape(-1)  # [batch * seq]
             out_flat = x_flat.new_empty((x_flat.shape[0], self.out_features))
@@ -196,6 +203,7 @@ class LayerwiseBitPredictor(nn.Module):
         self.max_bits = max_bits
 
         # 与 aggregate_layer 同维度思路：
+        # 输入先把并行路径拼到特征维，再预测每个 token 在每条路径上的 bit 分配。
         # Linear(parscale_n * hidden_size, hidden_size) -> SiLU -> Linear(hidden_size, parscale_n)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim * num_paths, hidden_dim),
@@ -229,8 +237,9 @@ class LayerwiseBitPredictor(nn.Module):
             bits: (batch, seq_len, num_paths) - 每个 token 的比特分配，sum = total_budget
             attn_probs: (batch, seq_len, num_paths) - 每个 token 的注意力概率，sum = 1
         """
-        # 1. 维度重排（借鉴 aggregate_layer）:
+        # 1) 维度重排（借鉴 aggregate_layer）:
         # (n_parscale * batch, seq_len, hidden_dim) -> (batch, seq_len, hidden_dim * n_parscale)
+        # 这样每个 token 的特征向量都显式包含所有并行路径信息。
         n_times_b, seq_len, hidden_dim = hidden_states.shape
         if n_times_b % self.num_paths != 0:
             raise ValueError(f"Hidden states batch {n_times_b} not divisible by num_paths {self.num_paths}")
@@ -242,7 +251,8 @@ class LayerwiseBitPredictor(nn.Module):
             b=batch_size
         )
 
-        # 2. 不对 seq_len 做池化，直接做 token-level bit 分配
+        # 2) 不对 seq_len 做池化，直接做 token-level bit 分配。
+        # 输出 logits 维度是 [batch, seq_len, num_paths]。
         # hidden_concat: (batch, seq_len, hidden_dim * n_parscale)
         # logits: (batch, seq_len, num_paths)
         logits = self.mlp(hidden_concat)
@@ -265,7 +275,8 @@ class LayerwiseBitPredictor(nn.Module):
         bits_discrete = torch.round(bits_continuous)
         bits = bits_discrete - bits_continuous.detach() + bits_continuous
 
-        # 8. 微调确保每个 token 的 sum 都精确等于 total_budget
+        # 8) 微调确保每个 token 的 sum 都精确等于 total_budget
+        # _adjust_to_exact_budget 实现是二维输入 [N, num_paths]，这里把 (b,s) 展平处理。
         bits_shape = bits.shape
         bits = self._adjust_to_exact_budget(bits.reshape(-1, self.num_paths), total_budget).reshape(bits_shape)
 
@@ -970,7 +981,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 )
 
                 # token-level 输出: (batch, seq_len, num_paths)
-                # 直接传给 MultiPrecisionLinear，下游会按 token/path 做混合精度执行
+                # 直接传给 MultiPrecisionLinear，下游按 token/path 执行混合精度。
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(

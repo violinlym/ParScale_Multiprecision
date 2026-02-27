@@ -44,7 +44,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 logger = logging.get_logger(__name__)
 
 
-class MultiPrecisionLinear(nn.Module):
+class MultiPrecisionLinear(nn.Module): # 实现 “混合精度并行推理”
     """
     Linear layer supporting dynamic multi-precision weights (2-8 bits).
 
@@ -90,7 +90,8 @@ class MultiPrecisionLinear(nn.Module):
         Args:
             x: Input tensor [batch_size, seq_len, in_features]
                or [(parscale_n * batch_size), seq_len, in_features]
-            assigned_bits: Bit allocation for each path [parscale_n] or None for FP mode
+            assigned_bits: Bit allocation tensor [batch, seq_len, parscale_n]
+                (per-token per-path), or None for FP mode
 
         Returns:
             Output tensor with same batch structure as input
@@ -100,23 +101,62 @@ class MultiPrecisionLinear(nn.Module):
             return nn.functional.linear(x, self.weight, self.bias)
 
         # Multi-precision forward: split by path and use different precisions
-        parscale_n = assigned_bits.shape[0]
+        parscale_n = assigned_bits.shape[-1]
 
         # Check if input has been repeated
         if x.shape[0] % parscale_n != 0:
             raise ValueError(f"Batch size {x.shape[0]} not divisible by parscale_n {parscale_n}")
 
-        batch_per_path = x.shape[0] // parscale_n
+        batch_per_path = x.shape[0] // parscale_n # 将输入张量 x 沿着 parscale_n 维度切分成 P 份（即 x_split）。
 
         # Reshape to separate paths: [(parscale_n * batch), seq, in] -> [parscale_n, batch, seq, in]
         x_split = x.view(parscale_n, batch_per_path, x.shape[1], x.shape[2])
 
+        # assigned_bits must be token-level [batch, seq_len, parscale_n]
+        if assigned_bits.dim() != 3:
+            raise ValueError(
+                f"assigned_bits must be 3D [batch, seq, parscale_n], got shape {tuple(assigned_bits.shape)}"
+            )
+        if (
+            assigned_bits.shape[0] != batch_per_path
+            or assigned_bits.shape[1] != x.shape[1]
+            or assigned_bits.shape[2] != parscale_n
+        ):
+            raise ValueError(
+                f"assigned_bits shape {assigned_bits.shape} must be [batch={batch_per_path}, seq={x.shape[1]}, parscale_n={parscale_n}]"
+            )
+        bits_view = assigned_bits
+
+        bits_view = torch.clamp(torch.round(bits_view), min=2, max=8).to(dtype=torch.int64, device=x.device)
+
         # Process each path with its assigned precision
         outputs = []
         for i in range(parscale_n):
-            bits = int(assigned_bits[i].item())
-            weight_i = self.mp_weight.get_weight(bits)  # [out_features, in_features]
-            output_i = nn.functional.linear(x_split[i], weight_i, self.bias)
+            x_i = x_split[i]  # [batch, seq, in_features]
+            path_bits = bits_view[:, :, i]  # [batch, seq]
+            unique_bits = torch.unique(path_bits)
+
+            # Fast path: one precision for the entire path
+            if unique_bits.numel() == 1:
+                bit_val = int(unique_bits.item())
+                weight_i = self.mp_weight.get_weight(bit_val)
+                output_i = nn.functional.linear(x_i, weight_i, self.bias)
+                outputs.append(output_i)
+                continue
+
+            # Token-level mixed precision: group tokens by bit-width
+            x_flat = x_i.reshape(-1, x_i.shape[-1])  # [batch * seq, in_features]
+            bits_flat = path_bits.reshape(-1)  # [batch * seq]
+            out_flat = x_flat.new_empty((x_flat.shape[0], self.out_features))
+
+            for bit_val in unique_bits.tolist():
+                mask = bits_flat == int(bit_val)
+                if not torch.any(mask):
+                    continue
+                weight_i = self.mp_weight.get_weight(int(bit_val))
+                out_flat[mask] = nn.functional.linear(x_flat[mask], weight_i, self.bias)
+
+            output_i = out_flat.view(batch_per_path, x.shape[1], self.out_features)
             outputs.append(output_i)
 
         # Concatenate back: [parscale_n, batch, seq, out] -> [(parscale_n * batch), seq, out]
@@ -155,9 +195,10 @@ class LayerwiseBitPredictor(nn.Module):
         self.min_bits = min_bits
         self.max_bits = max_bits
 
-        # 简单的两层 MLP
+        # 与 aggregate_layer 同维度思路：
+        # Linear(parscale_n * hidden_size, hidden_size) -> SiLU -> Linear(hidden_size, parscale_n)
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim * num_paths, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, num_paths)
         )
@@ -181,25 +222,37 @@ class LayerwiseBitPredictor(nn.Module):
         前向传播
 
         Args:
-            hidden_states: (batch, seq_len, hidden_dim) - 上一层的输出
+            hidden_states: (n_parscale * batch, seq_len, hidden_dim) - 所有路径的 hidden states
             total_budget: 总比特预算（默认32）
 
         Returns:
-            bits: (batch, num_paths) - 比特分配，sum = 32
-            attn_probs: (batch, num_paths) - 注意力概率，sum = 1
+            bits: (batch, seq_len, num_paths) - 每个 token 的比特分配，sum = total_budget
+            attn_probs: (batch, seq_len, num_paths) - 每个 token 的注意力概率，sum = 1
         """
-        # 1. 池化：对 seq_len 维度取平均
-        pooled = hidden_states.mean(dim=1)  # (batch, hidden_dim)
+        # 1. 维度重排（借鉴 aggregate_layer）:
+        # (n_parscale * batch, seq_len, hidden_dim) -> (batch, seq_len, hidden_dim * n_parscale)
+        n_times_b, seq_len, hidden_dim = hidden_states.shape
+        if n_times_b % self.num_paths != 0:
+            raise ValueError(f"Hidden states batch {n_times_b} not divisible by num_paths {self.num_paths}")
+        batch_size = n_times_b // self.num_paths
+        hidden_concat = rearrange(
+            hidden_states,
+            "(n_parscale b) s h -> b s (h n_parscale)",
+            n_parscale=self.num_paths,
+            b=batch_size
+        )
 
-        # 2. MLP 预测 attention logits
-        logits = self.mlp(pooled)  # (batch, num_paths)
+        # 2. 不对 seq_len 做池化，直接做 token-level bit 分配
+        # hidden_concat: (batch, seq_len, hidden_dim * n_parscale)
+        # logits: (batch, seq_len, num_paths)
+        logits = self.mlp(hidden_concat)
 
         # 3. Softmax 归一化
         temp = self.temperature.clamp(min=0.1, max=5.0)
-        attn_probs = torch.softmax(logits / temp, dim=-1)  # (batch, num_paths), sum=1
+        attn_probs = torch.softmax(logits / temp, dim=-1)  # (batch, seq_len, num_paths), sum=1
 
         # 4. 转换为比特数：bits = attn_probs * 32
-        bits_continuous = attn_probs * total_budget  # (batch, num_paths)
+        bits_continuous = attn_probs * total_budget  # (batch, seq_len, num_paths)
 
         # 5. Clamp 到 [min_bits, max_bits]
         bits_continuous = torch.clamp(bits_continuous, min=float(self.min_bits), max=float(self.max_bits))
@@ -212,8 +265,9 @@ class LayerwiseBitPredictor(nn.Module):
         bits_discrete = torch.round(bits_continuous)
         bits = bits_discrete - bits_continuous.detach() + bits_continuous
 
-        # 8. 微调确保精确 sum = 32
-        bits = self._adjust_to_exact_budget(bits, total_budget)
+        # 8. 微调确保每个 token 的 sum 都精确等于 total_budget
+        bits_shape = bits.shape
+        bits = self._adjust_to_exact_budget(bits.reshape(-1, self.num_paths), total_budget).reshape(bits_shape)
 
         return bits, attn_probs
 
@@ -908,25 +962,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 # 获取当前层的 bit predictor
                 bit_predictor = self.layerwise_bit_predictors[layer_idx]
 
-                # Reshape hidden_states for prediction
-                # hidden_states 当前是 (n_parscale * batch, seq_len, hidden_dim)
-                # 需要转换为 (batch, seq_len, hidden_dim)
-                batch_size_real = hidden_states.shape[0] // self.parscale_n
-                hidden_for_pred = rearrange(
-                    hidden_states,
-                    "(n_parscale b) s h -> b s h",
-                    n_parscale=self.parscale_n,
-                    b=batch_size_real
-                )
-
-                # 预测 bits
+                # 直接输入全部并行流 hidden_states: (n_parscale * batch, seq_len, hidden_dim)
+                # BitPredictor 内部会重排为 (batch, seq_len, hidden_dim * n_parscale)
                 assigned_bits, attn_probs = bit_predictor(
-                    hidden_for_pred,
+                    hidden_states,
                     total_budget=getattr(self.config, 'total_bits_budget', 32)
                 )
 
-                # 使用 batch 中第一个样本的 bits（所有样本分布类似）
-                assigned_bits = assigned_bits[0]  # [parscale_n]
+                # token-level 输出: (batch, seq_len, num_paths)
+                # 直接传给 MultiPrecisionLinear，下游会按 token/path 做混合精度执行
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
